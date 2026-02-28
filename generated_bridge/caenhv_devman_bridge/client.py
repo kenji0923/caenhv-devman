@@ -8,9 +8,48 @@ from devman_gen.runtime.client import ManagerClient
 try:
     from caen_libs.caenhvwrapper import *
     from caen_libs._caenhvwrappertypes import *
-    from caen_libs.caenhvwrapperflags import *
+    from collections.abc import *
 except Exception:
-    pass
+    # Fallback for machines without the backend library
+    from enum import Enum, IntEnum
+
+    class Device:
+        pass
+
+    class Error:
+        pass
+
+    class Sequence:
+        pass
+
+    class SystemType(IntEnum):
+        SY1527 = 0
+        SY2527 = 1
+        SY4527 = 2
+        SY5527 = 3
+        N568 = 4
+        V65XX = 5
+        N1470 = 6
+        V8100 = 7
+        N568E = 8
+        DT55XX = 9
+        FTK = 10
+        DT55XXE = 11
+        N1068 = 12
+        SMARTHV = 13
+        NGPS = 14
+        N1168 = 15
+        R6060 = 16
+
+    class LinkType(IntEnum):
+        TCPIP = 0
+        RS232 = 1
+        CAENET = 2
+        USB = 3
+        OPTLINK = 4
+        USB_VCP = 5
+        USB3 = 6
+        A4818 = 7
 
 _PARAM_ORDER = { 'Device_close': [],
   'Device_connect': [],
@@ -578,14 +617,3 @@ class Device:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
-
-
-class _LibProxy:
-    def sw_release(self) -> str:
-        try:
-            value = _CLIENT.invoke('lib.sw_release', [], {}, [])
-            return str(value)
-        except Exception:
-            return 'managed'
-
-lib = _LibProxy()
