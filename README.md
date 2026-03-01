@@ -18,6 +18,28 @@ The server manages resource ownership and routes requests to the CAEN HV backend
 python3 generated_bridge/caenhv_devman_bridge/server.py --backend-module caen_libs.caenhvwrapper
 ```
 
+### Start With Device Lifecycle Hooks
+
+Use `server_hooks.py` to connect to the CAEN crate at startup and close it on shutdown:
+
+```bash
+python3 generated_bridge/caenhv_devman_bridge/server.py \
+  --backend-module caen_libs.caenhvwrapper \
+  --init-file ./server_hooks.py \
+  --deinit-file ./server_hooks.py \
+  --hook-arg address=192.168.1.100 \
+  --hook-arg system_type=SY4527 \
+  --hook-arg link_type=TCPIP \
+  --hook-arg username=admin \
+  --hook-arg password=secret
+```
+
+Hook args:
+- `address` (required): crate address/IP
+- `system_type` (optional, default `SY4527`)
+- `link_type` (optional, default `TCPIP`)
+- `username`, `password` (optional)
+
 ### Configuration Options
 
 The server can be configured via command-line arguments or environment variables:
