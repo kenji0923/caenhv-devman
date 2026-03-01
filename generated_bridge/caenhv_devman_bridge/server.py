@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import socketserver
 
-from devman_gen.runtime.server import RuntimeFunctionSpec, serve_manager
+import devman_gen.runtime.server as runtime_server
+
+RuntimeFunctionSpec = runtime_server.RuntimeFunctionSpec
+serve_manager = runtime_server.serve_manager
 
 FUNCTIONS = { 'Device_get_bd_param': { 'dispatch': 'singleton',
                            'dispatch_target': 'get_bd_param',
@@ -165,6 +169,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+class _SingleThreadManagerTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address, core):
+        super().__init__(server_address, runtime_server._TCPHandler)
+        self.core = core
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run devman manager server')
     parser.add_argument('--backend-module', default=os.getenv('DEVMAN_BACKEND_MODULE'), required=False)
@@ -181,6 +193,12 @@ def main() -> None:
     parser.add_argument('--singleton-function', default=os.getenv('DEVMAN_SINGLETON_FUNCTION', ''))
     parser.add_argument('--singleton-file', default=os.getenv('DEVMAN_SINGLETON_FILE', ''))
     parser.add_argument('--singleton-file-function', default=os.getenv('DEVMAN_SINGLETON_FILE_FUNCTION', 'get_singleton'))
+    parser.add_argument(
+        '--single-threaded',
+        action='store_true',
+        default=_env_flag('DEVMAN_SINGLE_THREADED', True),
+        help='handle requests sequentially in one server thread',
+    )
     parser.add_argument('--hook-arg', action='append', default=[], help='key=value pair passed to hooks (repeatable)')
     args, extra_args = parser.parse_known_args()
     if not args.backend_module:
@@ -196,6 +214,9 @@ def main() -> None:
         hook_options = _parse_hook_args(list(args.hook_arg))
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.single_threaded:
+        runtime_server._ManagerTCPServer = _SingleThreadManagerTCPServer
 
     serve_manager(
         backend_module=args.backend_module,

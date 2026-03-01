@@ -117,6 +117,14 @@ def release(resource: str) -> bool:
     return _CLIENT.release(resource)
 
 
+def owner_of(resource: str) -> str | None:
+    return _CLIENT.owner_of(resource)
+
+
+def owners_of(resources: list[str]) -> dict[str, str | None]:
+    return _CLIENT.owners_of(resources)
+
+
 def connect(force: bool = False) -> None:
     _CLIENT.connect(force=force)
 
