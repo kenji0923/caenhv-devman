@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 import socketserver
 
@@ -177,6 +178,40 @@ class _SingleThreadManagerTCPServer(socketserver.TCPServer):
         self.core = core
 
 
+def _patch_runtime_timestamped_verbose_logs() -> None:
+    current = getattr(runtime_server.ManagerCore, "_log", None)
+    if current is None:
+        return
+    if getattr(current, "__name__", "") == "_log_with_timestamp":
+        return
+
+    def _log_with_timestamp(self, message: str) -> None:
+        if self.verbose:
+            ts = datetime.now().isoformat(timespec="seconds")
+            print(f"[devman {ts}] {message}", file=runtime_server.sys.stderr, flush=True)
+
+    runtime_server.ManagerCore._log = _log_with_timestamp
+
+
+def _patch_runtime_shutdown_keep_ownership() -> None:
+    current = getattr(runtime_server.ManagerCore, "shutdown", None)
+    if current is None:
+        return
+    if getattr(current, "__name__", "") == "_shutdown_keep_ownership":
+        return
+
+    def _shutdown_keep_ownership(self) -> None:
+        with self._sessions_lock:
+            clients = list(self._sessions_by_name.keys())
+            self._sessions_by_name.clear()
+            self._sessions_by_id.clear()
+        for client in clients:
+            self._release_client_handles(client)
+        self.db.close()
+
+    runtime_server.ManagerCore.shutdown = _shutdown_keep_ownership
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Run devman manager server')
     parser.add_argument('--backend-module', default=os.getenv('DEVMAN_BACKEND_MODULE'), required=False)
@@ -214,6 +249,9 @@ def main() -> None:
         hook_options = _parse_hook_args(list(args.hook_arg))
     except ValueError as exc:
         parser.error(str(exc))
+
+    _patch_runtime_timestamped_verbose_logs()
+    _patch_runtime_shutdown_keep_ownership()
 
     if args.single_threaded:
         runtime_server._ManagerTCPServer = _SingleThreadManagerTCPServer
