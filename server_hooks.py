@@ -1,9 +1,217 @@
 from __future__ import annotations
 
-from threading import RLock
+import socket as _socket
+import sys
+from threading import Event, RLock, Thread
 from typing import Any
 
 _ACTIVE_DEVICE: Any | None = None
+_TELEGRAF_SAMPLER: "_TelegrafSampler | None" = None
+
+
+class _TelegrafSampler:
+    """Sample all channel parameters and ship them to Telegraf.
+
+    Runs its own thread inside the devman server process; reads go straight
+    to the device singleton (the _AutoReconnectDevice lock serializes them
+    against client requests). Interval is clamped to [1, 100] seconds.
+    """
+
+    MIN_INTERVAL_SEC = 1.0
+    MAX_INTERVAL_SEC = 100.0
+
+    # GUI-consistent field names for CAEN parameter names.
+    _FIELD_ALIASES = {"v0set": "vset", "i0set": "iset", "rdown": "rdwn"}
+    # Fields written as integers when numeric.
+    _INT_FIELDS = {"status", "pw", "pon", "tripint", "tripext"}
+    # Magnitude voltages displayed/logged signed on negative-polarity slots.
+    _SIGNED_VOLTAGE_FIELDS = {"vset", "svmax", "vmon"}
+
+    def __init__(
+        self,
+        device: Any,
+        sender: Any,
+        measurement: str,
+        host_tag: str,
+        interval_sec: float,
+    ) -> None:
+        self._device = device
+        self._sender = sender
+        self._measurement = str(measurement)
+        self._host_tag = str(host_tag)
+        self._interval_sec = min(self.MAX_INTERVAL_SEC, max(self.MIN_INTERVAL_SEC, float(interval_sec)))
+        self._stop = Event()
+        self._thread: Thread | None = None
+        self._channels_by_slot: dict[int, int] = {}
+        self._negative_by_slot: dict[int, bool] = {}
+        self._params_by_slot: dict[int, list[str]] = {}
+        self._last_error = ""
+
+    @property
+    def interval_sec(self) -> float:
+        return self._interval_sec
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = Thread(target=self._loop, name="caenhv-telegraf", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _log(self, message: str) -> None:
+        print(f"[caenhv telegraf] {message}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _board_name(board: Any) -> str:
+        if isinstance(board, dict):
+            for key in ("model", "name", "model_name", "description", "type"):
+                value = board.get(key)
+                if value is not None and str(value).strip():
+                    return str(value)
+            return "Board"
+        return str(
+            getattr(board, "model", None)
+            or getattr(board, "name", None)
+            or getattr(board, "model_name", None)
+            or board.__class__.__name__
+        )
+
+    @staticmethod
+    def _board_channels(board: Any) -> int:
+        if isinstance(board, dict):
+            for key in ("n_channel", "n_channels", "num_channels"):
+                if key in board and board.get(key) is not None:
+                    try:
+                        return int(board.get(key))
+                    except Exception:
+                        return 0
+            channels = board.get("channels")
+            return len(channels) if isinstance(channels, list) else 0
+        try:
+            return int(getattr(board, "n_channel", 0) or 0)
+        except Exception:
+            return 0
+
+    def _detect_negative(self, slot: int, board_name: str) -> bool:
+        # Must mirror caenhv-client's heuristic exactly so logged signs
+        # always agree with the GUI display.
+        model = str(board_name).strip().upper()
+        if model.endswith("DN") or (" DN" in model):
+            return True
+        try:
+            prop = self._device.get_ch_param_prop(slot, 0, "V0Set")
+        except Exception:
+            return False
+        if isinstance(prop, dict):
+            minval, maxval = prop.get("minval"), prop.get("maxval")
+        else:
+            minval = getattr(prop, "minval", None)
+            maxval = getattr(prop, "maxval", None)
+        try:
+            return minval is not None and maxval is not None and float(maxval) <= 0.0 and float(minval) < 0.0
+        except Exception:
+            return False
+
+    def _scan_topology(self) -> None:
+        crate_map = self._device.get_crate_map()
+        channels: dict[int, int] = {}
+        negative: dict[int, bool] = {}
+        params: dict[int, list[str]] = {}
+        for slot, board in enumerate(crate_map):
+            if board is None:
+                continue
+            count = self._board_channels(board)
+            if count <= 0:
+                continue
+            channels[int(slot)] = count
+            negative[int(slot)] = self._detect_negative(int(slot), self._board_name(board))
+            try:
+                info = self._device.get_ch_param_info(int(slot), 0)
+                params[int(slot)] = [str(n) for n in info] if isinstance(info, (list, tuple)) else []
+            except Exception:
+                params[int(slot)] = []
+        self._channels_by_slot = channels
+        self._negative_by_slot = negative
+        self._params_by_slot = params
+
+    def _field_for(self, param_name: str) -> str:
+        lowered = str(param_name).lower()
+        return self._FIELD_ALIASES.get(lowered, lowered)
+
+    def _convert(self, field: str, value: Any, negative: bool) -> Any:
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if field in self._SIGNED_VOLTAGE_FIELDS and negative:
+                number = -abs(number)
+            elif field == "imon":
+                number = abs(number)
+            elif field == "rup":
+                # Signed slew convention: sign is the direction of signed-
+                # voltage motion the parameter governs.
+                number = -abs(number) if negative else abs(number)
+            elif field == "rdwn":
+                number = abs(number) if negative else -abs(number)
+            if field in self._INT_FIELDS:
+                return int(number)
+            return number
+        return str(value)
+
+    def sample_once(self) -> list[str]:
+        from devman_runtime.telegraf import build_line
+
+        if not self._channels_by_slot:
+            self._scan_topology()
+        lines: list[str] = []
+        for slot, count in sorted(self._channels_by_slot.items()):
+            channel_list = list(range(count))
+            negative = self._negative_by_slot.get(slot, False)
+            try:
+                labels = self._device.get_ch_name(slot, channel_list)
+            except Exception:
+                labels = [""] * count
+            fields_by_channel: dict[int, dict[str, Any]] = {ch: {} for ch in channel_list}
+            for param in self._params_by_slot.get(slot, []):
+                try:
+                    values = self._device.get_ch_param(slot, channel_list, param)
+                except Exception:
+                    continue
+                if not isinstance(values, list):
+                    continue
+                field = self._field_for(param)
+                for ch, value in zip(channel_list, values):
+                    if value is None:
+                        continue
+                    fields_by_channel[ch][field] = self._convert(field, value, negative)
+            for ch in channel_list:
+                fields = fields_by_channel[ch]
+                if not fields:
+                    continue
+                label = str(labels[ch]) if isinstance(labels, list) and ch < len(labels) else ""
+                tags = {"host": self._host_tag, "slot": slot, "ch": ch, "name": label}
+                lines.append(build_line(self._measurement, tags, fields))
+        return lines
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval_sec):
+            try:
+                lines = self.sample_once()
+                if lines:
+                    self._sender.send_lines(lines)
+                if self._last_error:
+                    self._log("recovered")
+                    self._last_error = ""
+            except Exception as exc:
+                message = str(exc)
+                if message != self._last_error:
+                    self._log(f"sampling failed: {message}")
+                    self._last_error = message
+                self._channels_by_slot = {}  # rescan topology next cycle
 
 
 def _parse_extra_args(extra_args: list[str]) -> dict[str, str]:
@@ -66,6 +274,7 @@ class _AutoReconnectDevice:
         address: str,
         username: str,
         password: str,
+        keepalive_sec: float,
     ) -> None:
         self._backend = backend
         self._system_type = system_type
@@ -76,6 +285,14 @@ class _AutoReconnectDevice:
         self._lock = RLock()
         self._dev = self._open_device()
 
+        self._keepalive_sec = float(max(0.0, keepalive_sec))
+        self._keepalive_stop = Event()
+        self._keepalive_thread: Thread | None = None
+        self._keepalive_method_name = self._pick_keepalive_method()
+        if self._keepalive_sec > 0.0 and self._keepalive_method_name:
+            self._keepalive_thread = Thread(target=self._keepalive_loop, daemon=True)
+            self._keepalive_thread.start()
+
     def _open_device(self):
         return self._backend.Device.open(
             self._system_type,
@@ -85,12 +302,50 @@ class _AutoReconnectDevice:
             self._password,
         )
 
+    def _pick_keepalive_method(self) -> str | None:
+        for name in ("get_crate_map", "get_sys_prop_list", "get_exec_comm_list"):
+            if callable(getattr(self._dev, name, None)):
+                return name
+        return None
+
+    def _run_keepalive_once(self) -> None:
+        method_name = self._keepalive_method_name
+        if not method_name or self._dev is None:
+            return
+        method = getattr(self._dev, method_name, None)
+        if not callable(method):
+            return
+        try:
+            method()
+            return
+        except Exception as exc:
+            if not _is_recoverable_connection_error(exc):
+                return
+            if self._reconnect_in_place():
+                retry = getattr(self._dev, method_name, None)
+                if callable(retry):
+                    try:
+                        retry()
+                        return
+                    except Exception:
+                        pass
+            try:
+                self._reopen_device()
+            except Exception:
+                return
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.wait(self._keepalive_sec):
+            with self._lock:
+                self._run_keepalive_once()
+
     def _reopen_device(self) -> None:
         # Open first, swap only on success so we never lose a potentially
         # still-usable existing handle when re-open fails.
         new_dev = self._open_device()
         old = self._dev
         self._dev = new_dev
+        self._keepalive_method_name = self._pick_keepalive_method()
         try:
             if old is not None and hasattr(old, "close"):
                 old.close()
@@ -111,6 +366,9 @@ class _AutoReconnectDevice:
             return False
 
     def close(self) -> None:
+        self._keepalive_stop.set()
+        if self._keepalive_thread is not None:
+            self._keepalive_thread.join(timeout=2.0)
         with self._lock:
             if self._dev is None:
                 return
@@ -164,6 +422,11 @@ def init(backend, hook_args, extra_args, **_kwargs):
     link_name = _pick(opts, "link_type", default="TCPIP")
     username = _pick(opts, "username", default="") or ""
     password = _pick(opts, "password", default="") or ""
+    keepalive_raw = _pick(opts, "keepalive_sec", default="10") or "10"
+    try:
+        keepalive_sec = float(keepalive_raw)
+    except Exception:
+        keepalive_sec = 10.0
 
     system_type = _resolve_enum(backend, "SystemType", system_name or "SY4527")
     link_type = _resolve_enum(backend, "LinkType", link_name or "TCPIP")
@@ -175,12 +438,45 @@ def init(backend, hook_args, extra_args, **_kwargs):
         address=address,
         username=username,
         password=password,
+        keepalive_sec=keepalive_sec,
     )
+
+    telegraf_url = _pick(opts, "telegraf_url")
+    if telegraf_url:
+        from devman_runtime.telegraf import TelegrafSender
+
+        measurement = _pick(opts, "telegraf_measurement", default="caenhv") or "caenhv"
+        host_tag = _pick(opts, "telegraf_host", default=_socket.gethostname()) or _socket.gethostname()
+        interval_raw = _pick(opts, "telegraf_interval_sec", default="10") or "10"
+        try:
+            interval_sec = float(interval_raw)
+        except Exception:
+            interval_sec = 10.0
+        global _TELEGRAF_SAMPLER
+        _TELEGRAF_SAMPLER = _TelegrafSampler(
+            device=_ACTIVE_DEVICE,
+            sender=TelegrafSender(telegraf_url),
+            measurement=measurement,
+            host_tag=host_tag,
+            interval_sec=interval_sec,
+        )
+        _TELEGRAF_SAMPLER.start()
+        print(
+            f"[caenhv telegraf] sampling every {_TELEGRAF_SAMPLER.interval_sec:.1f}s "
+            f"-> {telegraf_url} measurement={measurement} host={host_tag}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     return _ACTIVE_DEVICE
 
 
 def deinit(**_kwargs) -> None:
-    global _ACTIVE_DEVICE
+    global _ACTIVE_DEVICE, _TELEGRAF_SAMPLER
+    sampler = _TELEGRAF_SAMPLER
+    _TELEGRAF_SAMPLER = None
+    if sampler is not None:
+        sampler.stop()
     dev = _ACTIVE_DEVICE
     _ACTIVE_DEVICE = None
     if dev is None:
