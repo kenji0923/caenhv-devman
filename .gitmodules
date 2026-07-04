@@ -1,0 +1,3 @@
+[submodule "generated_bridge/caenhv-devman-server"]
+	path = generated_bridge/caenhv-devman-server
+	url = https://github.com/kenji0923/caenhv-devman-server.git
