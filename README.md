@@ -6,7 +6,7 @@ This project provides a bridge and management layer for CAEN High Voltage system
 
 - Python 3.10+
 - `caen_libs.caenhvwrapper` (The backend library for CAEN HV)
-- `devman-runtime` (PyPI; provides `serve_manager`, `ManagerCore`, the trip watchdog, and the client runtime)
+- `devman-runtime` (PyPI; provides `serve_manager`, `ManagerCore`, client leases, and the client runtime)
 
 ## Repository Layout / Regeneration
 
@@ -54,19 +54,21 @@ Hook args:
 
 Clients (e.g. caenhv-client) can register groups of linked channels with `set_link_groups`; the registry is persisted in the SQLite database and survives client disconnects. With the watchdog enabled, the server polls the Status of every registered channel and, when one channel of a group trips (external/internal trip bits), powers off the remaining ON channels of that group — even if the registering client is no longer running. Power-off is written directly on the device, bypassing ownership (switching off is the safe direction).
 
-Enable it with:
+Enable it with a hook arg (the watchdog is CAEN policy and lives in `server_hooks.py`, on top of devman-runtime's generic registry and client leases):
 
 ```bash
-python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py ... --trip-watchdog-interval 1.0
+python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py ... \
+  --init-file ./server_hooks.py --deinit-file ./server_hooks.py \
+  --hook-arg watchdog_interval_sec=1.0
 ```
 
-(or `DEVMAN_TRIP_WATCHDOG_INTERVAL=1.0`; `0` disables, which is the default). Requires the device singleton (init hook) to be configured. Watchdog actions are always logged to stderr.
+(`0` disables, which is the default; requires devman-runtime >= 0.2.0). Watchdog actions are always logged to stderr.
 
 New protocol ops: `set_link_groups` (replaces all groups of the calling client; groups are lists of `slot:S:ch:C` resource strings; singleton groups are ignored) and `list_link_groups`.
 
 #### Client leases and the stale-group janitor
 
-Every authenticated request renews a client's lease (`--client-lease-sec` / `DEVMAN_CLIENT_LEASE_SEC`, default 90 s; `0` disables). The watchdog applies janitor rules to groups whose owner's lease has expired:
+Every authenticated request renews a client's lease (`--client-lease-sec` / `DEVMAN_CLIENT_LEASE_SEC`, default 90 s; `0` disables) — a generic devman-runtime feature. The watchdog applies janitor rules to groups whose owner's lease has expired:
 
 - all member channels cleanly off (no ON, no trip bits) → the group is removed and logged;
 - any member energized or trip-latched → the group is kept and stays watchdog-protected; if its RUp/RDWn/PDwn are additionally inconsistent, a warning is logged (protection is never dropped from energized channels on inference).
