@@ -99,6 +99,20 @@ Schema: tags `host`, `slot`, `ch`, `name` (channel label); fields are the lower-
 caenhv,ch=3,host=labpc1,name=anode\ L,slot=1 vmon=-1499.8,imon=0.52,vset=-1500.0,rup=-5.0,rdwn=15.0,status=1i,pw=1i,pdwn="Ramp",svmax=-3000.0
 ```
 
+### Configuration via Environment / Env File
+
+Everything — server flags **and** hook args — can be configured by environment variables, so the whole launch reduces to:
+
+```bash
+python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py --env-file /opt/caenhv-devman/server.env
+```
+
+(or `DEVMAN_ENV_FILE=...`, or systemd `EnvironmentFile=`). See `server.env.example` for a complete template. Rules:
+
+- Generated server flags use the `DEVMAN_*` variables from the table below (plus `DEVMAN_INIT_FILE`, `DEVMAN_DEINIT_FILE`, `DEVMAN_CLIENT_LEASE_SEC`, ...).
+- Hook args (`address`, `watchdog_interval_sec`, `telegraf_*`, ...) resolve as: explicit `--hook-arg` > `DEVMAN_HOOK_ARG_<KEY>` (also `DEVMAN_<KEY>` / plain `<KEY>`) > default.
+- Real environment variables take precedence over the env-file contents; the env file is loaded before argument defaults are evaluated.
+
 ### Configuration Options
 
 The server can be configured via command-line arguments or environment variables:

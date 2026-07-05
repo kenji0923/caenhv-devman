@@ -447,6 +447,35 @@ def _pick(source: dict[str, str], *keys: str, default: str | None = None) -> str
     return default
 
 
+def _pick_env(*keys: str, default: str | None = None) -> str | None:
+    import os
+
+    for key in keys:
+        normalized = key.upper().replace("-", "_")
+        candidates = [
+            key,
+            key.upper(),
+            f"DEVMAN_{key.upper()}",
+            f"DEVMAN_HOOK_ARG_{key.upper()}",
+            normalized,
+            f"DEVMAN_{normalized}",
+            f"DEVMAN_HOOK_ARG_{normalized}",
+        ]
+        for env_key in candidates:
+            value = os.getenv(env_key)
+            if value is not None and str(value).strip() != "":
+                return str(value)
+    return default
+
+
+def _pick_with_env(source: dict[str, str], *keys: str, default: str | None = None) -> str | None:
+    """--hook-arg wins; otherwise fall back to environment variables."""
+    value = _pick(source, *keys)
+    if value is not None and str(value).strip() != "":
+        return value
+    return _pick_env(*keys, default=default)
+
+
 def _resolve_enum(module: Any, type_name: str, raw_value: str):
     enum_type = getattr(module, type_name)
     try:
@@ -619,15 +648,15 @@ def init(backend, hook_args, extra_args, **_kwargs):
     parsed_extra = _parse_extra_args(list(extra_args))
     opts = {**parsed_extra, **dict(hook_args)}
 
-    address = _pick(opts, "address", "arg", "device_ip", "crate_ip")
+    address = _pick_with_env(opts, "address", "device_host", "arg", "device_ip", "crate_ip")
     if not address:
         raise ValueError("missing device address; pass --hook-arg address=<ip>")
 
-    system_name = _pick(opts, "system_type", default="SY4527")
-    link_name = _pick(opts, "link_type", default="TCPIP")
-    username = _pick(opts, "username", default="") or ""
-    password = _pick(opts, "password", default="") or ""
-    keepalive_raw = _pick(opts, "keepalive_sec", default="10") or "10"
+    system_name = _pick_with_env(opts, "system_type", default="SY4527")
+    link_name = _pick_with_env(opts, "link_type", default="TCPIP")
+    username = _pick_with_env(opts, "username", default="") or ""
+    password = _pick_with_env(opts, "password", default="") or ""
+    keepalive_raw = _pick_with_env(opts, "keepalive_sec", default="10") or "10"
     try:
         keepalive_sec = float(keepalive_raw)
     except Exception:
@@ -646,7 +675,7 @@ def init(backend, hook_args, extra_args, **_kwargs):
         keepalive_sec=keepalive_sec,
     )
 
-    watchdog_raw = _pick(opts, "watchdog_interval_sec", default="0") or "0"
+    watchdog_raw = _pick_with_env(opts, "watchdog_interval_sec", default="0") or "0"
     try:
         watchdog_interval = float(watchdog_raw)
     except Exception:
@@ -676,13 +705,13 @@ def init(backend, hook_args, extra_args, **_kwargs):
                 flush=True,
             )
 
-    telegraf_url = _pick(opts, "telegraf_url")
+    telegraf_url = _pick_with_env(opts, "telegraf_url")
     if telegraf_url:
         from devman_runtime.telegraf import TelegrafSender
 
-        measurement = _pick(opts, "telegraf_measurement", default="caenhv") or "caenhv"
-        host_tag = _pick(opts, "telegraf_host", default=_socket.gethostname()) or _socket.gethostname()
-        interval_raw = _pick(opts, "telegraf_interval_sec", default="10") or "10"
+        measurement = _pick_with_env(opts, "telegraf_measurement", default="caenhv") or "caenhv"
+        host_tag = _pick_with_env(opts, "telegraf_host", default=_socket.gethostname()) or _socket.gethostname()
+        interval_raw = _pick_with_env(opts, "telegraf_interval_sec", default="10") or "10"
         try:
             interval_sec = float(interval_raw)
         except Exception:
