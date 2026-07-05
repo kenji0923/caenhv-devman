@@ -5,8 +5,12 @@ This project provides a bridge and management layer for CAEN High Voltage system
 ## Prerequisites
 
 - Python 3.10+
-- `caen_libs.caenhvwrapper` (The backend library for CAEN HV)
-- `devman-runtime` (PyPI; provides `serve_manager`, `ManagerCore`, client leases, and the client runtime)
+- The native **CAEN HV Wrapper Library** (`libcaenhvwrapper.so`) from [caen.it](https://www.caen.it/products/caen-hv-wrapper-library/) — the only manual install; `caen-libs` is just its ctypes binding and cannot work without it.
+- Python dependencies (`caen-libs`, `devman-runtime`) are installed automatically with the server package:
+
+```bash
+pip install ./generated_bridge/caenhv-devman-server
+```
 
 ## Repository Layout / Regeneration
 
@@ -24,7 +28,6 @@ The server manages resource ownership and routes requests to the CAEN HV backend
 ### Basic Command
 
 ```bash
-pip install devman-runtime
 python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py --backend-module caen_libs.caenhvwrapper
 ```
 
