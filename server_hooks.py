@@ -398,7 +398,14 @@ class _TelegrafSampler:
                 if not fields:
                     continue
                 label = str(labels[ch]) if isinstance(labels, list) and ch < len(labels) else ""
-                tags = {"host": self._host_tag, "slot": slot, "ch": ch, "name": label}
+                # Zero-pad slot/ch so Grafana's lexical tag sort orders them
+                # numerically (00, 01, ... 10 instead of 0, 1, 10, 2).
+                tags = {
+                    "host": self._host_tag,
+                    "slot": f"{int(slot):02d}",
+                    "ch": f"{int(ch):02d}",
+                    "name": label,
+                }
                 lines.append(build_line(self._measurement, tags, fields))
         return lines
 

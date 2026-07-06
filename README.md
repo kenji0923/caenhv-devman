@@ -96,10 +96,10 @@ python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py
 - `telegraf_url` (enables logging): `udp://host:port` (socket_listener) or `http://host:port[/path]` (influxdb_listener / http_listener_v2; path defaults to `/write`).
 - `telegraf_measurement` (default `caenhv`), `telegraf_host` (default machine hostname), `telegraf_interval_sec` (default 10; clamped to 1–100 s).
 
-Schema: tags `host`, `slot`, `ch`, `name` (channel label); fields are the lower-cased CAEN parameter names with GUI-consistent aliases (`V0Set`→`vset`, `I0Set`→`iset`, `RDown`→`rdwn`). Sign conventions per slot polarity: `vmon`/`vset`/`svmax` signed (negative on negative boards), `imon` unsigned magnitude, and signed slew rates — `rup` carries the sign of the signed-voltage direction it governs (positive board: `rup`>0, `rdwn`<0; negative board: `rup`<0, `rdwn`>0). `status`/`pw`/`tripint`/`tripext` are integers, `pdwn` a string.
+Schema: tags `host`, `slot`, `ch` (both zero-padded to 2 digits so Grafana's lexical tag sort orders them numerically), `name` (channel label); fields are the lower-cased CAEN parameter names with GUI-consistent aliases (`V0Set`→`vset`, `I0Set`→`iset`, `RDown`→`rdwn`). Sign conventions per slot polarity: `vmon`/`vset`/`svmax` signed (negative on negative boards), `imon` unsigned magnitude, and signed slew rates — `rup` carries the sign of the signed-voltage direction it governs (positive board: `rup`>0, `rdwn`<0; negative board: `rup`<0, `rdwn`>0). `status`/`pw`/`tripint`/`tripext` are integers, `pdwn` a string.
 
 ```
-caenhv,ch=3,host=labpc1,name=anode\ L,slot=1 vmon=-1499.8,imon=0.52,vset=-1500.0,rup=-5.0,rdwn=15.0,status=1i,pw=1i,pdwn="Ramp",svmax=-3000.0
+caenhv,ch=03,host=labpc1,name=anode\ L,slot=01 vmon=-1499.8,imon=0.52,vset=-1500.0,rup=-5.0,rdwn=15.0,status=1i,pw=1i,pdwn="Ramp",svmax=-3000.0
 ```
 
 ### Configuration via Environment / Env File
