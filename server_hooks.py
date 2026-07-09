@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket as _socket
 import sys
 from threading import Event, RLock, Thread
@@ -10,6 +11,103 @@ _TELEGRAF_SAMPLER: "_TelegrafSampler | None" = None
 _TRIP_WATCHDOG: "TripWatchdog | None" = None
 
 _CHANNEL_RESOURCE_RE_PATTERN = r"^slot:(\d+):ch:(\d+)$"
+
+# Read methods routed through the server read cache; everything else (writes,
+# open/close) goes straight to the device.
+_CACHED_DEVICE_READS = frozenset(
+    {"get_ch_param", "get_ch_name", "get_crate_map", "get_ch_param_prop", "get_ch_param_info"}
+)
+
+
+class _CacheDeviceAdapter:
+    """Wraps the device so in-process consumers (Telegraf, watchdog) read
+    through the server read cache instead of hitting the crate directly.
+
+    Reads go through ``core.cached_call`` (which serializes on the singleton
+    lock only on a miss); writes go through ``core._call_singleton`` (serialized)
+    and then invalidate the affected cache entries. Consumers using this adapter
+    must NOT also wrap calls in the singleton lock (pass ``device_lock=None``),
+    since the cache path acquires it itself.
+    """
+
+    def __init__(self, device: Any, core: Any) -> None:
+        self._device = device
+        self._core = core
+
+    def get_ch_param(self, slot, channels, name):
+        value, _ts, _c = self._core.cached_call("Device_get_ch_param", [slot, channels, name])
+        return value
+
+    def get_ch_name(self, slot, channels):
+        value, _ts, _c = self._core.cached_call("Device_get_ch_name", [slot, channels])
+        return value
+
+    def get_crate_map(self):
+        value, _ts, _c = self._core.cached_call("Device_get_crate_map", [])
+        return value
+
+    def get_ch_param_prop(self, slot, channel, name):
+        value, _ts, _c = self._core.cached_call("Device_get_ch_param_prop", [slot, channel, name])
+        return value
+
+    def get_ch_param_info(self, slot, channel):
+        value, _ts, _c = self._core.cached_call("Device_get_ch_param_info", [slot, channel])
+        return value
+
+    def set_ch_param(self, slot, channels, name, value):
+        result = self._core._call_singleton("set_ch_param", [slot, channels, name, value], {})
+        self._core._invalidate_cache("Device_set_ch_param", [slot, channels, name, value], {})
+        return result
+
+    def __getattr__(self, name: str):
+        return getattr(self._device, name)
+
+
+def _caen_cache_resolver(function: str, args: list, kwargs: dict, core: Any):
+    """Answer a fine Device_get_ch_param(slot, [ch], name) from a cached bulk
+    (slot, all-channels, name) entry, so single-channel client reads share the
+    one bulk poll (0 extra device reads)."""
+    if function != "Device_get_ch_param" or len(args) < 3:
+        return None
+    slot, channel_list, name = args[0], args[1], args[2]
+    if not isinstance(channel_list, (list, tuple)) or len(channel_list) != 1:
+        return None
+    ch = int(channel_list[0])
+    for (fn, a_json, _k_json), (value, ts) in core.cache_snapshot().items():
+        if fn != "Device_get_ch_param":
+            continue
+        try:
+            a = json.loads(a_json)
+        except Exception:
+            continue
+        if a[0] == slot and a[2] == name and isinstance(a[1], list) and ch in a[1] and isinstance(value, list):
+            idx = a[1].index(ch)
+            if idx < len(value):
+                return ([value[idx]], ts)
+    return None
+
+
+def _make_cache_invalidate(core: Any):
+    def _invalidate(function: str, args: list, kwargs: dict):
+        # Device_set_ch_param(slot, channel_list, name, value) -> stale reads of
+        # that param on that slot (bulk and per-channel entries).
+        if function != "Device_set_ch_param" or len(args) < 3:
+            return []
+        slot, name = args[0], args[2]
+        keys = []
+        for key in core.cache_snapshot():
+            fn, a_json, _ = key
+            if fn != "Device_get_ch_param":
+                continue
+            try:
+                a = json.loads(a_json)
+            except Exception:
+                continue
+            if a[0] == slot and a[2] == name:
+                keys.append(key)
+        return keys
+
+    return _invalidate
 
 
 class TripWatchdog:
@@ -682,12 +780,23 @@ def init(backend, hook_args, extra_args, **_kwargs):
         keepalive_sec=keepalive_sec,
     )
 
+    core = _kwargs.get("core")
+    # When the server read cache is active, install the CAEN cache policy and
+    # route in-process consumers (Telegraf, watchdog) through the cache so a
+    # single server poll feeds everyone.
+    consumer_device = _ACTIVE_DEVICE
+    if core is not None and getattr(core, "cacheable_functions", None):
+        core.set_cache_policy(
+            resolver=_caen_cache_resolver, invalidate=_make_cache_invalidate(core)
+        )
+        consumer_device = _CacheDeviceAdapter(_ACTIVE_DEVICE, core)
+        print("[caenhv cache] Telegraf/watchdog read through the server cache", file=sys.stderr, flush=True)
+
     watchdog_raw = _pick_with_env(opts, "watchdog_interval_sec", default="0") or "0"
     try:
         watchdog_interval = float(watchdog_raw)
     except Exception:
         watchdog_interval = 0.0
-    core = _kwargs.get("core")
     if watchdog_interval > 0.0:
         if core is None:
             print(
@@ -698,12 +807,15 @@ def init(backend, hook_args, extra_args, **_kwargs):
             )
         else:
             global _TRIP_WATCHDOG
+            # The cache adapter serializes on the singleton lock itself, so the
+            # watchdog must not also hold it (would deadlock on a cache miss).
+            wd_lock = None if isinstance(consumer_device, _CacheDeviceAdapter) else getattr(core, "_singleton_lock", None)
             _TRIP_WATCHDOG = TripWatchdog(
-                device=_ACTIVE_DEVICE,
+                device=consumer_device,
                 db=core.db,
                 interval_sec=watchdog_interval,
                 is_client_live=core.is_client_live,
-                device_lock=getattr(core, "_singleton_lock", None),
+                device_lock=wd_lock,
             )
             _TRIP_WATCHDOG.start()
             print(
@@ -725,7 +837,7 @@ def init(backend, hook_args, extra_args, **_kwargs):
             interval_sec = 10.0
         global _TELEGRAF_SAMPLER
         _TELEGRAF_SAMPLER = _TelegrafSampler(
-            device=_ACTIVE_DEVICE,
+            device=consumer_device,
             sender=TelegrafSender(telegraf_url),
             measurement=measurement,
             host_tag=host_tag,

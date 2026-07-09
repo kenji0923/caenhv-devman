@@ -102,6 +102,25 @@ Schema: tags `host`, `slot`, `ch` (both zero-padded to 2 digits so Grafana's lex
 caenhv,ch=03,host=labpc1,name=anode\ L,slot=01 vmon=-1499.8,imon=0.52,vset=-1500.0,rup=-5.0,rdwn=15.0,status=1i,pw=1i,pdwn="Ramp",svmax=-3000.0
 ```
 
+### Server-Side Read Cache
+
+By default the server is a stateless pass-through: every read hits the crate. Set `--cache-poll-interval` (or `DEVMAN_CACHE_POLL_INTERVAL`) to a value **> 0** to enable a server-side read cache, so the four periodic readers (GUI poll, BeamOptics `get_many`, the Telegraf sampler, and the trip watchdog) share **one authoritative poll** instead of each hitting the hardware:
+
+```bash
+python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py \
+  --backend-module caen_libs.caenhvwrapper \
+  --init-file ./server_hooks.py --deinit-file ./server_hooks.py \
+  --hook-arg address=192.168.1.100 \
+  --cache-poll-interval 2
+```
+
+Behaviour:
+
+- **All `Device_get_*` reads** are served from the cache when it is enabled; **writes** (`Device_set_*`) always go live and evict the channels they touch (write-through), and a client may pass `fresh=true` on any read to bypass the cache for a guaranteed-live value.
+- A background thread re-polls the registered read-set every `--cache-poll-interval` seconds, acquiring the device lock **per read** (never for a whole cycle), so client writes still interleave. `0` (the default) disables caching entirely.
+- `caenhv-devman`'s hooks seed the poll-set with the efficient **bulk** reads the Telegraf sampler already uses (one `get_ch_param(slot, all_channels, param)` per slot/param) and register a resolver so a client's single-channel `get_ch_param(slot, [ch], name)` is answered from the cached bulk entry — single-channel client reads add **zero** extra device traffic.
+- Every read reply carries `cached: bool` and `ts: float` — `ts` is the wall-clock epoch of the **actual device read** that produced the value (shared by all cached reads between two poll cycles, advancing only when a new sample lands), so a polling client can compare `ts` across reads to tell a new sample from a repeat of one it has already seen.
+
 ### Configuration via Environment / Env File
 
 Everything — server flags **and** hook args — can be configured by environment variables, so the whole launch reduces to:
@@ -128,6 +147,7 @@ The server can be configured via command-line arguments or environment variables
 | `--db` | `DEVMAN_DB` | `./ownership.db` | Path to the SQLite database for tracking ownership. |
 | `--username` | `DEVMAN_USERNAME` | `""` | Default username for device connection. |
 | `--password` | `DEVMAN_PASSWORD` | `""` | Default password for device connection. |
+| `--cache-poll-interval` | `DEVMAN_CACHE_POLL_INTERVAL` | `0` | Seconds between server read-cache refreshes (`0` disables; `Device_get_*` served from cache when enabled). |
 
 ## Using the Clients
 
