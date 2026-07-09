@@ -65,7 +65,9 @@ python3 generated_bridge/caenhv-devman-server/src/caenhv_devman_server/server.py
   --hook-arg watchdog_interval_sec=1.0
 ```
 
-(`0` disables, which is the default; requires devman-runtime >= 0.2.0). Watchdog actions are always logged to stderr.
+(`0` disables, which is the default; requires devman-runtime >= 0.2.0). As with any hook arg, `watchdog_interval_sec` can also be set via the environment as `DEVMAN_HOOK_ARG_WATCHDOG_INTERVAL_SEC` (also `WATCHDOG_INTERVAL_SEC`) — see `server.env.example`. Watchdog actions are always logged to stderr.
+
+> **Interaction with the read cache.** When the server read cache is enabled (`--cache-poll-interval > 0`), the watchdog reads channel `Status` **through the cache** rather than the crate directly (unified polling — one server poll feeds Telegraf, the watchdog, and clients). `watchdog_interval_sec` then sets how often the watchdog *checks*, while `--cache-poll-interval` sets how *fresh* the Status it sees is; the effective trip-detection latency is bounded by the **slower** of the two. Keep `--cache-poll-interval ≤ watchdog_interval_sec` so the cache does not become the bottleneck (e.g. for 1 s trip response, set both to `1`).
 
 New protocol ops: `set_link_groups` (replaces all groups of the calling client; groups are lists of `slot:S:ch:C` resource strings; singleton groups are ignored) and `list_link_groups`.
 
@@ -120,6 +122,8 @@ Behaviour:
 - A background thread re-polls the registered read-set every `--cache-poll-interval` seconds, acquiring the device lock **per read** (never for a whole cycle), so client writes still interleave. `0` (the default) disables caching entirely.
 - `caenhv-devman`'s hooks seed the poll-set with the efficient **bulk** reads the Telegraf sampler already uses (one `get_ch_param(slot, all_channels, param)` per slot/param) and register a resolver so a client's single-channel `get_ch_param(slot, [ch], name)` is answered from the cached bulk entry — single-channel client reads add **zero** extra device traffic.
 - Every read reply carries `cached: bool` and `ts: float` — `ts` is the wall-clock epoch of the **actual device read** that produced the value (shared by all cached reads between two poll cycles, advancing only when a new sample lands), so a polling client can compare `ts` across reads to tell a new sample from a repeat of one it has already seen.
+
+Because the trip watchdog also reads `Status` through this cache, `--cache-poll-interval` bounds trip-detection latency — keep it `≤ watchdog_interval_sec` (see [Link-Group Trip Watchdog](#link-group-trip-watchdog)).
 
 ### Configuration via Environment / Env File
 
